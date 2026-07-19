@@ -236,7 +236,7 @@ def check_webview_ratio(files):
     }
 
 
-def check_iap_and_policy(files):
+def check_iap_and_policy(files, root):
     has_iap = any(IAP_RE.search(text) for _, text in files)
     has_policy_link = any(
         POLICY_RE.search(text) and URL_HINT_RE.search(text) for _, text in files
@@ -245,15 +245,33 @@ def check_iap_and_policy(files):
         EULA_RE.search(text) and URL_HINT_RE.search(text) for _, text in files
     )
     has_policy_mention = any(POLICY_RE.search(text) for _, text in files)
+
+    # Metadata EULA link is a separate requirement, checked in App Store
+    # description files (which the source scan deliberately skips).
+    has_eula_in_metadata = False
+    for meta in list(root.rglob("description.txt")) + \
+            list(root.rglob("AppStore_description.txt")):
+        if ".git" in meta.parts:
+            continue
+        try:
+            t = meta.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if EULA_RE.search(t) and URL_HINT_RE.search(t):
+            has_eula_in_metadata = True
+            break
+
     return {
         "has_iap": has_iap,
         "has_policy_link": has_policy_link,
         "has_eula_link": has_eula_link,
         "has_policy_mention_anywhere": has_policy_mention,
+        "has_eula_in_metadata": has_eula_in_metadata,
     }
 
 
 def build_report(root: Path):
+    root = Path(root).resolve()
     files = gather_source_files(root)
     plists = find_info_plists(root)
     plist_keys = {str(p): load_plist_keys(p) for p in plists}
@@ -263,7 +281,7 @@ def build_report(root: Path):
     has_social, has_apple = check_sign_in_with_apple(files)
     has_signup, has_delete = check_account_deletion(files)
     webview_info = check_webview_ratio(files)
-    iap_info = check_iap_and_policy(files)
+    iap_info = check_iap_and_policy(files, root)
 
     checks = []
 
@@ -364,25 +382,45 @@ def build_report(root: Path):
         })
 
     if iap_info["has_iap"]:
-        status = "PASS" if (iap_info["has_policy_link"] and iap_info["has_eula_link"]) else "FAIL"
+        # 3.1.2 has TWO distinct requirements that get conflated constantly:
+        #   (1) in-app: links reachable from the subscription screen itself
+        #       (checked from source). NOT safely autofixable — needs real UI.
+        #   (2) metadata: links in the App Store Connect description
+        #       (checked from a metadata/description file). Safely autofixable.
+        inapp_ok = iap_info["has_policy_link"] and iap_info["has_eula_link"]
         checks.append({
-            "id": "iap_policy_eula_links",
-            "guideline": "3.1.2",
-            "status": status,
+            "id": "iap_inapp_policy_eula_links",
+            "guideline": "3.1.2 (in-app)",
+            "status": "PASS" if inapp_ok else "FAIL",
             "summary": (
                 "IAP/subscription SDK detected; Privacy Policy and Terms of "
-                "Use links with a URL both found in source"
-                if status == "PASS" else
+                "Use links with a URL both found in app source"
+                if inapp_ok else
                 "IAP/subscription SDK detected but a Privacy Policy and/or "
-                "Terms of Use (EULA) link with an actual URL was not found "
-                "in source — required in-app for auto-renewable subscriptions"
+                "Terms of Use (EULA) link with an actual URL was not found in "
+                "app source — these must be reachable from the in-app "
+                "subscription screen. This is app-specific UI work; autofix "
+                "will NOT fake it for you."
             ),
             "detail": iap_info,
         })
+        meta_ok = iap_info.get("has_eula_in_metadata", False)
+        checks.append({
+            "id": "iap_metadata_eula_link",
+            "guideline": "3.1.2 (metadata)",
+            "status": "PASS" if meta_ok else "FAIL",
+            "summary": (
+                "Terms of Use (EULA) link found in App Store metadata "
+                "description" if meta_ok else
+                "No Terms of Use (EULA) link found in an App Store metadata "
+                "description file — required in App Store Connect metadata. "
+                "This one IS safe-autofixable (standard Apple EULA)."
+            ),
+        })
     else:
         checks.append({
-            "id": "iap_policy_eula_links",
-            "guideline": "3.1.2",
+            "id": "iap_inapp_policy_eula_links",
+            "guideline": "3.1.2 (in-app)",
             "status": "PASS",
             "summary": "No IAP/subscription SDK detected",
         })

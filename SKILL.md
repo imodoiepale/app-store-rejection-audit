@@ -11,15 +11,35 @@ This is risk reduction, not a guarantee. Apple's review is ultimately a human ju
 
 ## How to use this skill
 
-1. **If a project directory is available** (via bash/computer tools), run the automated scan first:
+1. **If a project directory is available** (via bash/computer tools), run the source scan first:
    ```
    python3 scripts/audit_project.py /path/to/project
    ```
-   This gives a PASS/WARN/FAIL report across the checks that can actually be verified by reading source code and config files.
+   This gives a PASS/WARN/FAIL report across the checks verifiable from source code and config files.
 
-2. **Walk through the manual items** the script cannot check — these live in App Store Connect or require a real device, not the codebase. Use the "Can't be automated" list at the bottom of the script's report, cross-referenced against the checklist below.
+2. **Run the asset/branding audit** for icon and launch-screen technical compliance:
+   ```
+   python3 scripts/audit_assets.py /path/to/project
+   ```
+   This checks the deterministic, technical subset of aesthetics: app-icon dimensions (1024×1024 master), alpha-channel presence (a top automated-rejection cause), hand-applied rounded corners, placeholder-looking flat icons, asset-catalog `Contents.json` integrity, and launch-screen presence. It uses Pillow for pixel-level checks if installed and degrades gracefully to header-only checks if not. It does **not** judge whether the design is *good* — only whether the asset files survive App Store Connect's automated validation and an obvious-placeholder eye test.
 
-3. **For anything flagged**, open the matching reference file before advising the user — it has the exact rejection language reviewers send, the specific fix, and edge cases people commonly get stuck on.
+3. **Optionally autofix the mechanical issues:**
+   ```
+   python3 scripts/autofix.py /path/to/project --dry-run      # preview diffs
+   python3 scripts/autofix.py /path/to/project                # apply safe fixes
+   python3 scripts/autofix.py /path/to/project --aggressive   # + scaffolds
+   ```
+   **Safe tier (default):** adds missing `Info.plist` usage strings (with editable `[EDIT]` defaults the user must reword), flattens icon alpha channels onto a solid background, appends Apple's standard EULA line to App Store metadata, and stubs a missing 1024 marketing-icon entry. **Aggressive tier (`--aggressive`):** emits clearly-marked *scaffolds* for Sign in with Apple and account deletion — never silent edits to working auth/purchase code, because those require Apple Developer config and backend work the tool can't do. Every autofix leaves `[EDIT]`/`TODO` markers the user must complete. **Prefer `--dry-run` first** so the user sees exactly what will change.
+
+4. **Walk through the manual items** the tooling cannot check — these live in App Store Connect or require a real device. Use the "Can't be automated" list at the bottom of the audit report, cross-referenced against the checklist below.
+
+5. **For anything flagged**, open the matching reference file before advising the user — it has the exact rejection language reviewers send, the specific fix, and edge cases people commonly get stuck on.
+
+### Honesty guardrails (important — do not soften these for the user)
+
+- **Never tell the user their app "will pass" or "is guaranteed approval."** Apple's review is a human judgment call against changing guidelines plus subjective criteria. The most this tooling does is reduce the *mechanical* failure surface. Say "this lowers your rejection risk on X, Y, Z," never "you're guaranteed."
+- **The test suite backtests the tool, not Apple.** `python3 tests/run_tests.py` proves the auditor flags what it claims and the autofixer produces re-auditable-clean output on mechanical checks. A green suite means the tool behaves as specified — it says nothing about whether a given submission is approved. Frame it that way if the user asks about "backtesting" or "total success."
+- **Autofix will deliberately leave some things failing** (in-app subscription links, Sign in with Apple, account deletion) rather than fake them. That's correct behavior — surface those to the user as real work they need to do, don't treat the remaining FAILs as a tool defect.
 
 | Flag / topic | Reference file |
 |---|---|
@@ -36,6 +56,7 @@ This is risk reduction, not a guarantee. Apple's review is ultimately a human ju
 | Missing/vague permission usage strings (camera, location, mic...) | `references/privacy-and-permissions.md` |
 | Privacy Nutrition Label / App Privacy questionnaire accuracy | `references/privacy-and-permissions.md` |
 | Third-party SDK privacy manifests, AI data-sharing disclosure | `references/privacy-and-permissions.md` |
+| App icon dimensions, alpha channel, rounded corners, placeholder art; launch screen; asset catalog | `references/assets-and-branding.md` |
 
 ## Master pre-submission checklist
 

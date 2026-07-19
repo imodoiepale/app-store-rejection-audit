@@ -1,0 +1,6 @@
+# Core scanning (audit_project.py) needs only the Python standard library.
+# The following is OPTIONAL — it enables pixel-level icon checks in
+# audit_assets.py (alpha channel, rounded corners, placeholder detection)
+# and icon alpha-flattening in autofix.py. Everything degrades gracefully
+# without it.
+Pillow>=9.0.0
