@@ -23,6 +23,26 @@ Apple will not review, or will reject, a binary that:
 - The description must be substantial and about the app itself — not just brand/company copy with no mention of what the app does.
 - Age rating must match the actual content.
 
+### 2.3.1 — Hidden features and claims that are not true
+
+Metadata and UI copy must describe what the binary does. Two shapes of failure: a feature switch that unlocks behaviour the reviewer cannot see (hidden features), and a claim the code cannot back — "zero-knowledge encryption", "military-grade security", "clinically proven" — with no implementation behind it. Reviewers grep for these in screenshots and onboarding; when challenged, "we plan to" is not an answer. Say what is true: "stored under row-level security, deletable any time, never used to train public models."
+
+### 2.3.10 — Other marketplaces and platforms
+
+No "Android", "Google Play", "available on the web", "Windows" in the description, screenshots or UI shown on iOS. A settings string that says "manage your subscription in Google Play" is enough. Hybrid apps ship one string table for three platforms, so this is where they get caught; gate the string with `isNative()` / `Platform.OS` or give the native build its own override key. `audit_project.py` reports these as `cross_platform_mentions` and notes whether the file also carries a platform guard.
+
+### 2.5.1 — HealthKit transparency
+
+If the app reads or writes HealthKit data: purpose strings for share and update, a privacy-policy section naming the data types, no use for advertising, no storage in iCloud. Mindfulness minutes written to HealthKit are the common wellness-app case.
+
+## 4.1(c) — Copycats (November 2025)
+
+An app whose name, icon or presentation could be mistaken for another developer's is rejected regardless of function. Keyword fields that contain competitor brand names are metadata spam under the same clause.
+
+## 4.7 — Mini apps and mini games (clarified November 2025)
+
+Apps that host other apps (HTML5 games, chatbots, plug-ins, mini programs) must use the in-process web technology, must not extend native APIs to that content, must apply the same guidelines to the hosted content and must offer IAP for any digital purchases inside it. A "skills" or "plug-in" marketplace inside a wellness app is 4.7 territory.
+
 ## 4.2 — Minimum Functionality
 
 This is the one that hits webview wrappers, PWA-style apps, and thin React Native/Flutter shells the hardest — it's a frequent rejection point for exactly the kind of full-stack/web-first apps that get ported to iOS as an afterthought.
