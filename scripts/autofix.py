@@ -13,11 +13,23 @@ Two tiers, by design:
       background (requires Pillow), fixing the #1 automated icon rejection.
     - Add a 1024 ios-marketing entry stub to an appiconset Contents.json if
       one is missing (points at an expected filename you then supply).
+    - Add ITSAppUsesNonExemptEncryption = false to Info.plist when absent
+      (the standard HTTPS-only exemption; the note tells you when that is
+      the wrong answer).
+    - Add a PrivacyInfo.xcprivacy required-reason entry (with the most
+      common approved code) for each category the audit found in your own
+      native code but not in the manifest — ITMS-91053 is an upload block.
+    - Annotate a floating `xcode: latest` CI pin with a TODO comment. It
+      never rewrites the pin itself: which Xcode meets the current minimum
+      is a fact about today, not about the repo.
 
   AGGRESSIVE (only with --aggressive, and always emitted as a reviewable
   patch/scaffold, NEVER a silent edit to working auth/purchase code):
     - Scaffold a Sign in with Apple button + entitlement notes.
     - Scaffold an in-app "Delete Account" flow stub.
+    - Scaffold a third-party AI consent screen (Swift + React/Capacitor)
+      that gates on the consent value ALONE — no "seen" flag.
+    - Scaffold a Restore Purchases control for the paywall.
   These require real integration work (Apple Developer config, entitlements,
   server-side token handling). The tool writes clearly-marked TODO scaffolds
   and prints exactly what you must complete by hand. It does not pretend the
@@ -221,7 +233,271 @@ def add_marketing_icon_stub(icon_findings, dry_run):
     return actions
 
 
+def add_export_compliance(export_check, plist_paths, dry_run):
+    """ITSAppUsesNonExemptEncryption = false. Setting it is what Apple's own
+    'Missing Compliance' dialog asks you for; `false` is right for an app
+    that only uses HTTPS/TLS. The note says when it is wrong."""
+    actions = []
+    if not export_check or export_check["status"] == "PASS" or not plist_paths:
+        return actions
+    target = min(plist_paths, key=lambda p: len(Path(p).parts))
+    actions.append({
+        "action": "add_export_compliance_key",
+        "file": target,
+        "key": "ITSAppUsesNonExemptEncryption",
+        "value": False,
+        "tier": "safe",
+        "status": "planned" if dry_run else "applied",
+        "note": "false asserts the app uses only exempt encryption (standard "
+                "HTTPS/TLS, OS-provided crypto). If you ship your own "
+                "encryption, proprietary algorithms, or a VPN, set this to "
+                "true and file the export documentation instead.",
+    })
+    if not dry_run:
+        try:
+            with open(target, "rb") as f:
+                data = plistlib.load(f)
+            data["ITSAppUsesNonExemptEncryption"] = False
+            with open(target, "wb") as f:
+                plistlib.dump(data, f)
+        except Exception as e:  # noqa: BLE001
+            actions[-1]["status"] = "error"
+            actions[-1]["detail"] = str(e)
+    return actions
+
+
+# The most common approved reason per category. CA92.1 = "app's own
+# UserDefaults", C617.1 = "timestamps of the app's own files", 35F9.1 =
+# "elapsed time inside the app", E174.1 = "check space before writing",
+# 3EC4.1 = "custom keyboard app". Every other code needs a reason the
+# developer must be able to defend, so we never guess past the default.
+DEFAULT_REASON_CODE = {
+    "NSPrivacyAccessedAPICategoryUserDefaults": "CA92.1",
+    "NSPrivacyAccessedAPICategoryFileTimestamp": "C617.1",
+    "NSPrivacyAccessedAPICategorySystemBootTime": "35F9.1",
+    "NSPrivacyAccessedAPICategoryDiskSpace": "E174.1",
+    "NSPrivacyAccessedAPICategoryActiveKeyboards": "3EC4.1",
+}
+
+
+def add_required_reason_entries(rra_check, plist_paths, dry_run):
+    """ITMS-91053. Adds the missing NSPrivacyAccessedAPITypes entries to the
+    existing PrivacyInfo.xcprivacy, or creates one next to the main
+    Info.plist when the project has none."""
+    actions = []
+    if not rra_check or rra_check["status"] != "FAIL":
+        return actions
+    detail = rra_check.get("detail") or {}
+    missing = detail.get("missing") or []
+    if not missing:
+        return actions
+    manifests = detail.get("manifests_found") or []
+    if manifests:
+        target = Path(min(manifests, key=lambda p: len(Path(p).parts)))
+    elif plist_paths:
+        main_plist = Path(min(plist_paths, key=lambda p: len(Path(p).parts)))
+        target = main_plist.parent / "PrivacyInfo.xcprivacy"
+    else:
+        return actions
+    try:
+        if target.exists():
+            with open(target, "rb") as f:
+                data = plistlib.load(f)
+        else:
+            data = {"NSPrivacyTracking": False, "NSPrivacyTrackingDomains": [],
+                    "NSPrivacyCollectedDataTypes": [],
+                    "NSPrivacyAccessedAPITypes": []}
+    except Exception as e:  # noqa: BLE001
+        return [{"action": "add_required_reason_entries", "status": "error",
+                 "tier": "safe", "file": str(target),
+                 "detail": f"could not read manifest: {e}"}]
+    entries = data.setdefault("NSPrivacyAccessedAPITypes", [])
+    for m in missing:
+        cat = m["category"]
+        code = DEFAULT_REASON_CODE.get(cat, (m.get("approved_reasons") or ["?"])[0])
+        actions.append({
+            "action": "add_required_reason_entry",
+            "file": str(target),
+            "key": cat,
+            "value": code,
+            "tier": "safe",
+            "status": "planned" if dry_run else "applied",
+            "note": f"Reason {code} is the most common approved code for this "
+                    "category. Confirm it describes YOUR use; the approved "
+                    f"list is {', '.join(m.get('approved_reasons') or [])}. "
+                    "A new manifest must also be added to the app target in "
+                    "Xcode (Build Phases → Copy Bundle Resources).",
+        })
+        if not dry_run:
+            entries.append({"NSPrivacyAccessedAPIType": cat,
+                            "NSPrivacyAccessedAPITypeReasons": [code]})
+    if actions and not dry_run:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "wb") as f:
+            plistlib.dump(data, f)
+    return actions
+
+
+def annotate_ci_xcode_pin(ci_check, dry_run):
+    """Puts a TODO line above a floating Xcode pin. Deliberately does not
+    choose a version: the right one is 'whatever meets Apple's minimum
+    today', which this tool cannot know when it runs next year."""
+    actions = []
+    if not ci_check or ci_check["status"] == "PASS":
+        return actions
+    marker = "# TODO(app-store-audit): pin an explicit Xcode version"
+    for hit in ci_check.get("detail") or []:
+        f = Path(hit["file"])
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines(keepends=True)
+        except OSError:
+            continue
+        idx = hit["line"] - 1
+        if idx < 0 or idx >= len(lines) or any(marker in l for l in lines):
+            continue
+        indent = re.match(r"\s*", lines[idx]).group(0)
+        actions.append({
+            "action": "annotate_floating_xcode_pin",
+            "file": str(f),
+            "tier": "safe",
+            "status": "planned" if dry_run else "applied",
+            "note": "Added a TODO above the floating pin. Replace 'latest' "
+                    "with the Xcode version that meets the current SDK "
+                    "minimum (https://developer.apple.com/news/upcoming-requirements/).",
+        })
+        if not dry_run:
+            lines.insert(idx, f"{indent}{marker} — Apple's SDK minimum moves "
+                              f"every April; 'latest' drifts with the CI image\n")
+            f.write_text("".join(lines), encoding="utf-8")
+    return actions
+
+
 # ---- Aggressive tier: scaffolds only, never silent edits ----
+
+AI_CONSENT_SWIFT_SCAFFOLD = '''\
+// AUTO-GENERATED SCAFFOLD — third-party AI consent (Guideline 5.1.2(i))
+// This is NOT complete. To finish:
+//   1. Fill in WHAT is sent and WHO receives it, by legal entity:
+//      "the text of your journal entry" → "OpenAI, L.L.C. (GPT-4o)", not
+//      "some data" → "our AI partner".
+//   2. Show this view BEFORE the first network call to any AI vendor. Gate
+//      on `hasConsented` ALONE. Do not add a hasSeen / didShow / firstLaunch
+//      flag to the condition — that is the documented repeat-rejection
+//      trap: the flag differs on the reviewer's device and the screen
+//      never appears.
+//   3. Make the privacy policy and the App Privacy labels say the same
+//      thing (reviewers compare all three).
+import SwiftUI
+
+struct AIConsentGate<Content: View>: View {
+    @AppStorage("ai_consent_granted") private var hasConsented = false
+    let content: () -> Content
+    var body: some View {
+        if hasConsented {
+            content()
+        } else {
+            AIConsentView { hasConsented = true }
+        }
+    }
+}
+
+struct AIConsentView: View {
+    let onAccept: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Before we begin").font(.title2.bold())
+            Text("To generate your guidance, DepthMe sends [EDIT: what data — "
+                 + "e.g. your survey answers and journal text] to "
+                 + "[EDIT: vendor legal name and product, e.g. OpenAI, L.L.C. "
+                 + "(GPT-4o)]. It is used only to produce your content and is "
+                 + "not used to train public models.")
+            Link("Privacy Policy", destination: URL(string: "[EDIT: https://…/privacy]")!)
+            Button("I agree", action: onAccept).buttonStyle(.borderedProminent)
+            Button("Not now") { /* TODO: keep the user in a non-AI part of the app */ }
+        }
+        .padding()
+    }
+}
+'''
+
+AI_CONSENT_REACT_SCAFFOLD = '''\
+// AUTO-GENERATED SCAFFOLD — third-party AI consent (Guideline 5.1.2(i))
+// React / React Native / Capacitor variant. This is NOT complete. To finish:
+//   1. Fill in WHAT is sent and WHO receives it, by legal entity.
+//   2. Render <AiConsentGate> around every screen that triggers an AI call,
+//      and check `consent` on the server too — the client gate is UX, the
+//      server check is the guarantee.
+//   3. Gate on the stored consent value ALONE. No hasSeen / didShow /
+//      firstLaunch flag in the condition (documented repeat-rejection trap).
+//   4. Persist per ACCOUNT, not per device: a reviewer on a fresh install
+//      with the demo account must still see it exactly once.
+import { useEffect, useState } from 'react';
+
+const KEY = 'ai_consent_granted_at';
+
+export function useAiConsent() {
+  const [consent, setConsent] = useState<string | null>(() => {
+    try { return localStorage.getItem(KEY); } catch { return null; }
+  });
+  const grant = () => {
+    const now = new Date().toISOString();
+    try { localStorage.setItem(KEY, now); } catch { /* storage unavailable */ }
+    setConsent(now);
+    // TODO: also persist to the user's profile row (ai_consent_at).
+  };
+  return { consent, grant };
+}
+
+export function AiConsentGate({ children }: { children: React.ReactNode }) {
+  const { consent, grant } = useAiConsent();
+  if (consent) return <>{children}</>;
+  return (
+    <section>
+      <h2>Before we begin</h2>
+      <p>
+        To generate your guidance, this app sends [EDIT: what data] to
+        [EDIT: vendor legal name (product)], and [EDIT: second vendor] for
+        [EDIT: purpose]. It is used only to produce your content and is not
+        used to train public models. <a href="[EDIT: privacy url]">Privacy Policy</a>
+      </p>
+      <button onClick={grant}>I agree</button>
+      <button>{/* TODO: route to a non-AI part of the app */}Not now</button>
+    </section>
+  );
+}
+'''
+
+RESTORE_SWIFT_SCAFFOLD = '''\
+// AUTO-GENERATED SCAFFOLD — Restore Purchases on the paywall (Guideline 3.1.2)
+// Required even if entitlements auto-sync: the reviewer looks for the control
+// on the paywall itself, not in Settings. Place this on the purchase screen.
+import StoreKit
+import SwiftUI
+
+struct RestorePurchasesButton: View {
+    var body: some View {
+        Button("Restore Purchases") {
+            Task { try? await AppStore.sync() }
+        }
+    }
+}
+'''
+
+RESTORE_REACT_SCAFFOLD = '''\
+// AUTO-GENERATED SCAFFOLD — Restore Purchases on the paywall (Guideline 3.1.2)
+// RevenueCat / react-native-iap variant. Place it ON the paywall screen.
+// TODO: replace the restore call with your SDK's:
+//   RevenueCat (Capacitor):  Purchases.restorePurchases()
+//   RevenueCat (RN):         Purchases.restorePurchases()
+//   react-native-iap:        getAvailablePurchases()
+export function RestorePurchasesButton({ onRestore }: { onRestore: () => Promise<void> }) {
+  return (
+    <button type="button" onClick={() => { onRestore().catch(() => {/* surface a toast */}); }}>
+      Restore Purchases
+    </button>
+  );
+}
+'''
 
 SIWA_SWIFT_SCAFFOLD = '''\
 // AUTO-GENERATED SCAFFOLD — Sign in with Apple (Guideline 4.8)
@@ -265,9 +541,32 @@ func deleteAccount() async throws {
 '''
 
 
-def scaffold_aggressive(root: Path, need_siwa, need_delete, dry_run):
+def scaffold_aggressive(root: Path, need_siwa, need_delete, dry_run,
+                        need_ai_consent=False, need_restore=False):
     actions = []
     scaffold_dir = root / "app_store_audit_scaffolds"
+
+    def emit(action, filename, content, note):
+        target = scaffold_dir / filename
+        actions.append({
+            "action": action, "file": str(target), "tier": "aggressive",
+            "status": "planned" if dry_run else "written", "note": note,
+        })
+        if not dry_run:
+            scaffold_dir.mkdir(exist_ok=True)
+            target.write_text(content)
+
+    if need_ai_consent:
+        emit("scaffold_ai_consent_gate", "AIConsentGate.swift", AI_CONSENT_SWIFT_SCAFFOLD,
+             "Scaffold only — fill in what data / which vendor (legal entity); "
+             "gate on the consent value alone.")
+        emit("scaffold_ai_consent_gate", "AiConsentGate.tsx", AI_CONSENT_REACT_SCAFFOLD,
+             "React/Capacitor variant of the same scaffold.")
+    if need_restore:
+        emit("scaffold_restore_purchases", "RestorePurchasesButton.swift",
+             RESTORE_SWIFT_SCAFFOLD, "Scaffold only — place it on the paywall.")
+        emit("scaffold_restore_purchases", "RestorePurchasesButton.tsx",
+             RESTORE_REACT_SCAFFOLD, "React/RN variant; wire your SDK's restore call.")
     if need_siwa:
         target = scaffold_dir / "AppleSignInButton.swift"
         actions.append({
@@ -322,13 +621,28 @@ def run_autofix(root: Path, audit_report, asset_report,
     actions += flatten_icon_alpha(icon_findings, dry_run)
     actions += add_marketing_icon_stub(icon_findings, dry_run)
 
+    # Safe: upload-time blockers and TestFlight friction
+    plists = audit_report.get("info_plists_found", [])
+    actions += add_export_compliance(checks.get("export_compliance"), plists, dry_run)
+    actions += add_required_reason_entries(checks.get("required_reason_apis"),
+                                           plists, dry_run)
+    actions += annotate_ci_xcode_pin(checks.get("ci_xcode_pin"), dry_run)
+
     # Aggressive: scaffolds
     if aggressive:
         siwa = checks.get("sign_in_with_apple")
         deletion = checks.get("account_deletion")
+        ai = checks.get("ai_consent_gate")
+        paywall = checks.get("paywall_elements")
         need_siwa = bool(siwa and siwa["status"] == "FAIL")
         need_delete = bool(deletion and deletion["status"] == "FAIL")
-        actions += scaffold_aggressive(root, need_siwa, need_delete, dry_run)
+        need_ai = bool(ai and ai["status"] != "PASS")
+        need_restore = bool(
+            paywall and paywall["status"] == "FAIL" and
+            "restore_purchases" in ((paywall.get("detail") or {}).get("elements_missing") or []))
+        actions += scaffold_aggressive(root, need_siwa, need_delete, dry_run,
+                                       need_ai_consent=need_ai,
+                                       need_restore=need_restore)
 
     return {
         "project": str(root),
