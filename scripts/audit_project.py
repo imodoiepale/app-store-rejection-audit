@@ -717,8 +717,13 @@ def check_ai_consent(files):
     vendors_named = set()
     for path, text in _shipped_ui_files(files):
         visible = _visible_text(path, text)
+        # Names first, evidence second: the evidence loop stops at the first
+        # hit per file, and a vendor listed after that hit still counts as
+        # named (it did not, and reported "Deepgram never named" on a file
+        # that named all four).
         for m in AI_VENDOR_NAME_RE.finditer(visible):
             vendors_named.add(m.group(0))
+        for m in AI_VENDOR_NAME_RE.finditer(visible):
             lo, hi = max(0, m.start() - 400), m.end() + 400
             if CONSENT_WORD_RE.search(visible[lo:hi]):
                 idx = text.find(m.group(0))
@@ -977,6 +982,11 @@ def check_cross_platform_mentions(files):
             if is_i18n:
                 km = re.match(r'\s*"([^"]+)"\s*:', line)
                 key = km.group(1) if km else ""
+                # Keys starting with "_" are maintainer notes inside the
+                # string table, never rendered — the place a comment about
+                # Google Play belongs, not a finding.
+                if key.startswith("_"):
+                    continue
             hits.append({"file": str(p), "line": lineno, "term": m.group(0),
                          "gated": "unknown (i18n)" if is_i18n else guarded,
                          "key": key, "snippet": line.strip()[:140]})
